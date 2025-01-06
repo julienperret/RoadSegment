@@ -1,10 +1,16 @@
 // standard includes
+#include <sys/stat.h>
 #include <iostream>
 #include <fstream>
 #include <cassert>
 #include <string>
 #include <chrono>
 #include <ctime>
+#include <sstream>
+
+// GDAL
+#include "ogrsf_frmts.h"
+// END GDAL
 
 // define the kernel
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
@@ -108,12 +114,12 @@ using Polygon_with_holes_2 = CGAL::Polygon_with_holes_2<Kernel>;
 using namespace std;
 
 std::string currentDateTime() {
-    std::time_t t = std::time(nullptr);
-    std::tm* now = std::localtime(&t);
- 
-    char buffer[128];
-    strftime(buffer, sizeof(buffer), "%m-%d-%Y %X", now);
-    return buffer;
+  std::time_t t = std::time(nullptr);
+  std::tm* now = std::localtime(&t);
+
+  char buffer[128];
+  strftime(buffer, sizeof(buffer), "%m-%d-%Y %X", now);
+  return buffer;
 }
 ///////////////////////////////// CODE ABOUT EXACT DUALS ///////////////////////////////////////////
 
@@ -225,21 +231,38 @@ CGAL::Object exact_primal(const Edge& e,
 ///////////////////////////////// CODE TO DRAW A CROPPED DIAGRAM ///////////////////////////////////
 
 template< typename OutputKernel>
-void export_segment(const CGAL::Segment_2<OutputKernel>& segment, Red_blue info, const double xmin, const double ymin, std::ofstream& ofile)
+void export_segment(const CGAL::Segment_2<OutputKernel>& segment, Red_blue info, const double xmin, const double ymin, 
+  OGRLayer *poLayer, const bool output_all_segments)
 {
-  ofile << "\"LINESTRING(";
-  ofile << CGAL::to_double(segment.source().x()+xmin) << " ";
-  ofile << CGAL::to_double(segment.source().y()+ymin) << ", ";
-  ofile << CGAL::to_double(segment.target().x()+xmin) << " ";
-  ofile << CGAL::to_double(segment.target().y()+ymin) << ")\",";
-  ofile << info << "\n" << std::flush;
+  if (!output_all_segments && info != -1) return; 
+  OGRFeature *poFeature;
+  poFeature = OGRFeature::CreateFeature( poLayer->GetLayerDefn() );
+  poFeature->SetField( "Ring", info );
+  OGRLineString linestring;
+  linestring.addPoint(CGAL::to_double(segment.source().x()+xmin),CGAL::to_double(segment.source().y()+ymin));
+  linestring.addPoint(CGAL::to_double(segment.target().x()+xmin),CGAL::to_double(segment.target().y()+ymin));
+  poFeature->SetGeometry( &linestring );
+  if( poLayer->CreateFeature( poFeature ) != OGRERR_NONE )
+  {
+    printf( "Failed to create feature in file.\n" );
+    exit( 1 );
+  }
+  OGRFeature::DestroyFeature( poFeature );
+  // ofile << "\"LINESTRING(";
+  // ofile << CGAL::to_double(segment.source().x()+xmin) << " ";
+  // ofile << CGAL::to_double(segment.source().y()+ymin) << ", ";
+  // ofile << CGAL::to_double(segment.target().x()+xmin) << " ";
+  // ofile << CGAL::to_double(segment.target().y()+ymin) << ")\",";
+  // ofile << info << "\n" << std::flush;
 }
 
 // Split a Voronoi edge that is a parabola (one site is a point, one site is a segment) into small segments
 template <typename OutputKernel>
 void segment_parabola(const CGAL::Parabola_segment_2<OutputKernel>& p,
-                      const CGAL::Bbox_2& scaled_bbox, Red_blue info, const double xmin, const double ymin, std::ofstream& ofile)
+                      const CGAL::Bbox_2& scaled_bbox, Red_blue info, const double xmin, const double ymin, 
+                      OGRLayer *poLayer, const bool output_all_segments)
 {
+  if (!output_all_segments && info != -1) return; 
   using FT = typename OutputKernel::FT;
   using Point_2 = typename OutputKernel::Point_2;
   using Segment_2 = typename OutputKernel::Segment_2;
@@ -271,7 +294,7 @@ void segment_parabola(const CGAL::Parabola_segment_2<OutputKernel>& p,
   if(points.size() < 2) return;
 
   for(std::size_t i=0, ps=points.size()-1; i<ps; ++i)
-    export_segment(Segment_2(points[i], points[i+1]), info, xmin, ymin, ofile);
+    export_segment(Segment_2(points[i], points[i+1]), info, xmin, ymin, poLayer, output_all_segments);
     //segment_list.emplace_back(points[i], points[i+1]);
 }
 
@@ -279,7 +302,7 @@ template< typename OutputKernel>
 void fill_Voronoi_structure(const SDG& sdg,
                             const CGAL::Bbox_2& scaled_bbox,
                             const double xmin, const double ymin, 
-                            std::ofstream& ofile)
+                            OGRLayer *poLayer, const bool output_all_segments)
 {
   using Line_2 = typename OutputKernel::Line_2;
   using Ray_2 = typename OutputKernel::Ray_2;
@@ -307,9 +330,9 @@ void fill_Voronoi_structure(const SDG& sdg,
     Red_blue info = (r_info == s_info) ? r_info : -1;
 
     if(CGAL::assign(l, o)) { /*line_list.push_back(l);*/ ++nl; }
-    if(CGAL::assign(s, o)) { /*segment_list.push_back(s);*/ export_segment(s,info,xmin,ymin,ofile); ++ns; }
+    if(CGAL::assign(s, o)) { /*segment_list.push_back(s);*/ export_segment(s,info,xmin,ymin,poLayer,output_all_segments); ++ns; }
     if(CGAL::assign(r, o)) { /*ray_list.push_back(r);*/ ++nr; }
-    if(CGAL::assign(p, o)) { segment_parabola(p, scaled_bbox, info, xmin,ymin, ofile); ++np; }
+    if(CGAL::assign(p, o)) { segment_parabola(p, scaled_bbox, info, xmin,ymin, poLayer,output_all_segments); ++np; }
   }
 }
 
@@ -318,20 +341,110 @@ Point_2 translate(const Point_2& p, double x, double y)
   return Point_2(p.x()+x, p.y()+y);
 }
 
-int main()
+inline bool file_exists (const char* name) {
+  struct stat buffer;   
+  return (stat (name, &buffer) == 0); 
+}
+
+int main(int argc, char *argv[])
 {
   cout << currentDateTime() << ": start" << endl;
-  ifstream in("face.wkt");
-  Multipolygon_with_holes_2 mp;
-  CGAL::IO::read_multi_polygon_WKT(in, mp);
-  cout << currentDateTime() << ": computing bbox" << endl;
+  std::cout << "argc == " << argc << '\n';
+  for (int ndx{}; ndx != argc; ++ndx)
+    std::cout << "argv[" << ndx << "] == " << std::quoted(argv[ndx]) << '\n';
+  if (argc != 5) return EXIT_FAILURE;
+  const char *input_file_name = argv[1];
+  const char *input_layer = argv[2];
+  const char *output_file_name = argv[3];
+  std::stringstream ss(argv[4]);
+  bool output_all_segments;
+  if(!(ss >> std::boolalpha >> output_all_segments)) {
+    // Parsing error.
+    std::cout << "could not parse output_all_segments with value: " << output_all_segments << '\n';
+    return EXIT_FAILURE;
+  }
+  std::cout << "output_all_segments = " << output_all_segments << '\n';
+  GDALAllRegister();
+  GDALDataset *poDS;
+  poDS = (GDALDataset*) GDALOpenEx( input_file_name, GDAL_OF_VECTOR, NULL, NULL, NULL );
+  if( poDS == NULL )
+  {
+      printf( "Open failed.\n" );
+      exit( 1 );
+  }
+  OGRLayer *poLayer;
+  poLayer = poDS->GetLayerByName( input_layer );
+  OGRSpatialReference *spatialRef = poLayer->GetSpatialRef();
   std::set<Point_2> all_points;
-  for(Polygon_with_holes_2 p : mp) { 
-    for(const Segment_2& e  : p.outer_boundary().edges()){
-      all_points.insert(e.source());
-      all_points.insert(e.target());
+  for( auto& poFeature: poLayer )
+  {
+    // for( auto&& oField: *poFeature )
+    // {
+    //   if( oField.IsUnset() )
+    //   {
+    //     printf("(unset),");
+    //     continue;
+    //   }
+    //   if( oField.IsNull() )
+    //   {
+    //     printf("(null),");
+    //     continue;
+    //   }
+    //   switch( oField.GetType() )
+    //   {
+    //     case OFTInteger:
+    //       printf( "%d,", oField.GetInteger() );
+    //       break;
+    //     case OFTInteger64:
+    //       printf( CPL_FRMT_GIB ",", oField.GetInteger64() );
+    //       break;
+    //     case OFTReal:
+    //       printf( "%.3f,", oField.GetDouble() );
+    //       break;
+    //     case OFTString:
+    //       // GetString() returns a C string
+    //       printf( "%s,", oField.GetString() );
+    //       break;
+    //     default:
+    //       // Note: we use GetAsString() and not GetString(), since
+    //       // the later assumes the field type to be OFTString while the
+    //       // former will do a conversion from the original type to string.
+    //       printf( "%s,", oField.GetAsString() );
+    //       break;
+    //   }
+    // }
+    OGRGeometry *poGeometry;
+    poGeometry = poFeature->GetGeometryRef();
+    if( poGeometry != NULL && wkbFlatten(poGeometry->getGeometryType()) == wkbPolygon )
+    {
+    #if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(2,3,0)
+      OGRPolygon *poPolygon = poGeometry->toPolygon();
+    #else
+      OGRPolygon *poPolygon = (OGRPolygon *) poGeometry;
+    #endif
+      OGRLinearRing *ring = poPolygon->getExteriorRing();
+      int numPoints = ring->getNumPoints();
+      for (int iPoint = 0; iPoint < numPoints - 1; iPoint++)
+      {
+        all_points.insert(Point_2(ring->getX(iPoint),ring->getY(iPoint)));
+      }
+    }
+    else
+    {
+      printf( "no polygon geometry\n" );
     }
   }
+  // ifstream in("face.wkt");
+  // Multipolygon_with_holes_2 mp;
+  // CGAL::IO::read_multi_polygon_WKT(in, mp);
+  cout << currentDateTime() << ": computing bbox" << endl;
+  // std::set<Point_2> all_points;
+  // for(Polygon_with_holes_2 p : mp) { 
+  //   for(const Segment_2& e  : p.outer_boundary().edges()){
+  //     all_points.insert(e.source());
+  //     all_points.insert(e.target());
+  //   }
+  // }
 
   // Get the bbox of the input points, and grow it a bit
   const CGAL::Bbox_2 bbox = bbox_2(all_points.begin(), all_points.end());
@@ -354,29 +467,56 @@ int main()
   vector<SDG::Site_2> sites;
 
   int ring_index = 0;
-  for(Polygon_with_holes_2 p : mp) { 
-    cout << "polygon " <<ring_index<< endl;
-    for(const Segment_2& e  : p.outer_boundary().edges()){
-      //cout << e << endl;
-      site = SDG::Site_2::construct_site_2(translate(e.source(),-xmin,-ymin), translate(e.target(),-xmin,-ymin));
-      //site.set_info(ring_index);
-      //sites.push_back(site);
-      sdg.insert(site, ring_index);
-    }
-    ring_index++;
-    typename Polygon_with_holes_2::Hole_const_iterator  hit;
-    for (hit = p.holes_begin(); hit != p.holes_end(); ++hit) {
-      cout << "hole " <<ring_index<< endl;
-      for(const Segment_2& e  : hit->edges()){
-        //cout << e << endl;
-        site = SDG::Site_2::construct_site_2(translate(e.source(),-xmin,-ymin), translate(e.target(),-xmin,-ymin));
-        //site.set_info(ring_index);
-        //sites.push_back(site);
+  for( auto& poFeature: poLayer )
+  {
+    OGRGeometry *poGeometry;
+    poGeometry = poFeature->GetGeometryRef();
+    if( poGeometry != NULL && wkbFlatten(poGeometry->getGeometryType()) == wkbPolygon )
+    {
+    #if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(2,3,0)
+      OGRPolygon *poPolygon = poGeometry->toPolygon();
+    #else
+      OGRPolygon *poPolygon = (OGRPolygon *) poGeometry;
+    #endif
+      OGRLinearRing *ring = poPolygon->getExteriorRing();
+      int numPoints = ring->getNumPoints();
+      //cout << "polygon " <<ring_index<< " with " << numPoints << " points" << endl;
+      for (int iPoint = 0; iPoint < numPoints - 1; iPoint++)
+      {
+        site = SDG::Site_2::construct_site_2(translate(Point_2(ring->getX(iPoint),ring->getY(iPoint)),-xmin,-ymin), translate(Point_2(ring->getX(iPoint+1),ring->getY(iPoint+1)),-xmin,-ymin));
         sdg.insert(site, ring_index);
       }
       ring_index++;
     }
+    else
+    {
+      printf( "no polygon geometry\n" );
+    }
   }
+
+  // for(Polygon_with_holes_2 p : mp) { 
+  //   cout << "polygon " <<ring_index<< endl;
+  //   for(const Segment_2& e  : p.outer_boundary().edges()){
+  //     //cout << e << endl;
+  //     site = SDG::Site_2::construct_site_2(translate(e.source(),-xmin,-ymin), translate(e.target(),-xmin,-ymin));
+  //     //site.set_info(ring_index);
+  //     //sites.push_back(site);
+  //     sdg.insert(site, ring_index);
+  //   }
+  //   ring_index++;
+  //   typename Polygon_with_holes_2::Hole_const_iterator  hit;
+  //   for (hit = p.holes_begin(); hit != p.holes_end(); ++hit) {
+  //     cout << "hole " <<ring_index<< endl;
+  //     for(const Segment_2& e  : hit->edges()){
+  //       //cout << e << endl;
+  //       site = SDG::Site_2::construct_site_2(translate(e.source(),-xmin,-ymin), translate(e.target(),-xmin,-ymin));
+  //       //site.set_info(ring_index);
+  //       //sites.push_back(site);
+  //       sdg.insert(site, ring_index);
+  //     }
+  //     ring_index++;
+  //   }
+  // }
   cout << currentDateTime() << ": inserting " << ring_index << " rings" <<endl;
   //insert the sites all at once using spatial sorting to speed the insertion
   //sdg.insert( sites.begin(), sites.end(), CGAL::Tag_true() );
@@ -385,12 +525,60 @@ int main()
   //assert( sdg.is_valid(true, 1) );
   cout << sdg.is_valid(true, 1) << endl;
   // Output to WKT file
-  std::ofstream contour_ofile ("sdg_info.wkt");
-  contour_ofile.precision(18);
-  contour_ofile << "wkt,ring\n";
+  // std::ofstream contour_ofile ("sdg_info.wkt");
+  // contour_ofile.precision(18);
+  // contour_ofile << "wkt,ring\n";
   cout << currentDateTime() << ": fill_Voronoi_structure" << endl;
-  fill_Voronoi_structure<EK>(sdg, scaled_bbox, xmin, ymin, contour_ofile);
-  contour_ofile.close();
+  const char *pszDriverName = "GPKG";
+  GDALDriver *poDriver;
+  poDriver = GetGDALDriverManager()->GetDriverByName(pszDriverName );
+  if( poDriver == NULL )
+  {
+    printf( "%s driver not available.\n", pszDriverName );
+    exit( 1 );
+  }
+  GDALDataset *poDS_out;
+  if (file_exists(output_file_name))
+  {
+    // char **papszOptions = nullptr;
+    // papszOptions = CSLAddNameValue(papszOptions, "OVERWRITE", "YES");
+    // poDS_out = (GDALDataset*) GDALOpenEx( output_file_name, GDAL_OF_UPDATE, NULL, papszOptions, NULL );
+    poDS_out = (GDALDataset*) GDALOpenEx( output_file_name, GDAL_OF_UPDATE, NULL, NULL, NULL );
+  }
+  else
+  {
+    poDS_out = poDriver->Create( output_file_name, 0, 0, 0, GDT_Unknown, NULL );
+  }
+  if( poDS_out == NULL )
+  {
+    printf( "Creation of output file failed.\n" );
+    exit( 1 );
+  }
+  OGRLayer *poLayer_out;
+  poLayer_out = poDS_out->CreateLayer( input_layer, spatialRef, wkbLineString, NULL );
+  if( poLayer_out == NULL )
+  {
+    printf( "Layer creation failed.\n" );
+    exit( 1 );
+  }
+  OGRFieldDefn oField( "Ring", OFTString );
+  oField.SetWidth(32);
+  if( poLayer_out->CreateField( &oField ) != OGRERR_NONE )
+  {
+    printf( "Creating Ring field failed.\n" );
+    exit( 1 );
+  }
+  // OGRFeature *poFeature;
+  // poFeature = OGRFeature::CreateFeature( poLayer->GetLayerDefn() );
+  // poFeature->SetField( "Ring", szName )
+  // OGRLineString pt;
+  // pt.setX( x );
+  // pt.setY( y );
+  // poFeature->SetGeometry( &pt );
+
+  fill_Voronoi_structure<EK>(sdg, scaled_bbox, xmin, ymin, poLayer_out, output_all_segments);
+  GDALClose( poDS_out );
+  // contour_ofile.close();
   cout << currentDateTime() << ": done" << endl;
   return 0;
 }
